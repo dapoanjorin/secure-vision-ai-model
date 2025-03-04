@@ -1,20 +1,20 @@
 import os
 import cv2
-import torch
 import time
 import requests
 from flask import Flask, request, jsonify
 from werkzeug.utils import secure_filename
+from ultralytics import YOLO
 
 # 🔹 Flask App Initialization
 app = Flask(__name__)
 app.config["UPLOAD_FOLDER"] = "uploads"
 os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
 
-# 🔹 YOLOv5 Model Load
-print("📌 Loading YOLOv5 model...")
-model = torch.hub.load("ultralytics/yolov5", "yolov5s")
-model.conf = 0.25  # Confidence threshold
+# 🔹 YOLOv8 Model Load
+print("📌 Loading YOLOv8 model...")
+model = YOLO("yolov8s.pt")  # Using YOLOv8 small model
+conf_threshold = 0.25  # Confidence threshold
 
 # 🔹 Server URL for Alert
 ALERT_API_URL = "https://secure-vision-server.onrender.com/api/alerts"
@@ -50,6 +50,7 @@ def process_video(video_path):
 
     print("🚀 Processing video...")
 
+    # Define classes of interest with their respective COCO class indices for YOLOv8
     classes_of_interest = {
         0: "person",
         2: "car",
@@ -65,25 +66,35 @@ def process_video(video_path):
         if not ret:
             break
 
-        results = model(frame)
-        detections = results.pandas().xyxy[0]
-        relevant_detections = detections[detections["class"].isin(classes_of_interest.keys())]
-
-        if not relevant_detections.empty:
-            print("\n🔍 Detected Objects:")
-            for _, detection in relevant_detections.iterrows():
-                class_id = int(detection["class"])
-                class_name = classes_of_interest.get(class_id, f"class_{class_id}")
-                confidence = detection["confidence"]
-                x1, y1, x2, y2 = map(int, detection[["xmin", "ymin", "xmax", "ymax"]])
-
-                print(f"  - {class_name}: {confidence:.2f} at [{x1}, {y1}, {x2}, {y2}]")
-
-                detected_objects.append({"object": class_name, "confidence": confidence, "bounding_box": [x1, y1, x2, y2]})
-
-                # Send an alert for a detected weapon
-                if class_name == "knife":
-                    send_alert(class_name, confidence, [x1, y1, x2, y2])
+        # Process frame with YOLOv8
+        results = model(frame, conf=conf_threshold)
+        
+        # YOLOv8 returns a Results object which we can iterate through
+        for r in results:
+            boxes = r.boxes
+            
+            for box in boxes:
+                cls_id = int(box.cls.item())
+                
+                # Check if detected class is in our classes of interest
+                if cls_id in classes_of_interest:
+                    class_name = classes_of_interest[cls_id]
+                    confidence = box.conf.item()
+                    
+                    # Get bounding box coordinates and convert to integers
+                    x1, y1, x2, y2 = map(int, box.xyxy.tolist()[0])
+                    
+                    print(f"  - {class_name}: {confidence:.2f} at [{x1}, {y1}, {x2}, {y2}]")
+                    
+                    detected_objects.append({
+                        "object": class_name,
+                        "confidence": confidence,
+                        "bounding_box": [x1, y1, x2, y2]
+                    })
+                    
+                    # Send an alert for a detected weapon
+                    if class_name == "knife":
+                        send_alert(class_name, confidence, [x1, y1, x2, y2])
 
     cap.release()
     return {"detections": detected_objects, "message": "Video processing complete"}
