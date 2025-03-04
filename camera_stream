@@ -1,0 +1,404 @@
+import os
+import cv2
+import time
+import threading
+import argparse
+import json
+import requests
+from datetime import datetime
+from ultralytics import YOLO
+
+# Import shared configurations and functions from main module
+# Assuming the main file is named 'video_detector.py'
+try:
+    from video_detector import (
+        CLASSES_OF_INTEREST, 
+        HIGH_ALERT_OBJECTS, 
+        get_threat_severity, 
+        send_alert, 
+        process_frame
+    )
+except ImportError:
+    # If import fails, define the functions and variables here
+    # This is a simplified version for this example
+    CLASSES_OF_INTEREST = {
+        0: "person", 2: "car", 3: "motorcycle", 43: "knife", 67: "cell phone", 73: "scissors"
+    }
+    HIGH_ALERT_OBJECTS = ["knife", "scissors"]
+    
+    model = YOLO("yolov8s.pt")
+    conf_threshold = 0.25
+    ALERT_API_URL = "https://secure-vision-server.onrender.com/api/alerts"
+    
+    def get_threat_severity(object_name):
+        high_severity_objects = ["knife", "scissors"]
+        medium_severity_objects = ["bottle", "sports ball", "backpack"]
+        
+        if object_name in high_severity_objects:
+            return "High"
+        elif object_name in medium_severity_objects:
+            return "Medium"
+        else:
+            return "Low"
+    
+    def send_alert(object_name, confidence, bounding_box, location="Unknown", frame_timestamp=None):
+        severity = get_threat_severity(object_name)
+        
+        alert_data = {
+            "type": "Security Alert",
+            "description": f"Detected {object_name} with {confidence:.2f} confidence",
+            "severity": severity,
+            "location": location,
+            "timestamp": frame_timestamp or time.strftime("%Y-%m-%d %H:%M:%S"),
+            "metadata": {
+                "object": object_name,
+                "confidence": confidence,
+                "bounding_box": bounding_box,
+                "threat_level": severity
+            },
+        }
+
+        try:
+            response = requests.post(ALERT_API_URL, json=alert_data, headers={"Content-Type": "application/json"})
+            if response.status_code == 201:
+                print(f"Alert sent successfully for {object_name} ({severity} severity).")
+            else:
+                print(f"Failed to send alert. Status: {response.status_code}")
+        except Exception as e:
+            print(f"Error sending alert: {str(e)}")
+    
+    def process_frame(frame, frame_count=0, location="Unknown", frame_timestamp=None):
+        if frame_timestamp is None:
+            frame_timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        
+        results = model(frame, conf=conf_threshold)
+        
+        frame_detections = []
+        
+        for r in results:
+            boxes = r.boxes
+            
+            for box in boxes:
+                cls_id = int(box.cls.item())
+                
+                if cls_id in CLASSES_OF_INTEREST:
+                    class_name = CLASSES_OF_INTEREST[cls_id]
+                    confidence = box.conf.item()
+                    
+                    x1, y1, x2, y2 = map(int, box.xyxy.tolist()[0])
+                    
+                    detection_info = {
+                        "object": class_name,
+                        "confidence": confidence,
+                        "bounding_box": [x1, y1, x2, y2],
+                        "frame": frame_count,
+                        "timestamp": frame_timestamp,
+                        "location": location
+                    }
+                    
+                    frame_detections.append(detection_info)
+                    
+                    if class_name in HIGH_ALERT_OBJECTS:
+                        send_alert(class_name, confidence, [x1, y1, x2, y2], location, frame_timestamp)
+        
+        return frame_detections
+
+class CameraStream:
+    """Class to handle a security camera stream."""
+    
+    def __init__(self, camera_id, stream_url, location_name, recording_dir="recordings"):
+        self.camera_id = camera_id
+        self.stream_url = stream_url
+        self.location = location_name
+        self.recording_dir = recording_dir
+        self.running = False
+        self.cap = None
+        self.thread = None
+        self.frame_count = 0
+        self.recording = False
+        self.writer = None
+        self.start_time = None
+        self.detections = []
+        
+        # Create recording directory if it doesn't exist
+        os.makedirs(self.recording_dir, exist_ok=True)
+        os.makedirs(os.path.join(self.recording_dir, f"camera_{self.camera_id}"), exist_ok=True)
+    
+    def start(self):
+        """Start processing the camera stream."""
+        if self.running:
+            print(f"Camera {self.camera_id} already running")
+            return
+        
+        self.running = True
+        self.thread = threading.Thread(target=self._process_stream)
+        self.thread.daemon = True
+        self.thread.start()
+        print(f"Started camera {self.camera_id} at {self.location}")
+    
+    def stop(self):
+        """Stop processing the camera stream."""
+        self.running = False
+        if self.thread:
+            self.thread.join(timeout=1.0)
+        if self.cap:
+            self.cap.release()
+        if self.recording and self.writer:
+            self.writer.release()
+            print(f"Saved recording for camera {self.camera_id}")
+        print(f"Stopped camera {self.camera_id}")
+    
+    def start_recording(self):
+        """Start recording the camera stream."""
+        if not self.recording:
+            self.recording = True
+            now = datetime.now()
+            self.start_time = now
+            filename = os.path.join(
+                self.recording_dir,
+                f"camera_{self.camera_id}",
+                f"{now.strftime('%Y%m%d_%H%M%S')}.mp4"
+            )
+            
+            # Get camera properties
+            width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            fps = int(self.cap.get(cv2.CAP_PROP_FPS))
+            
+            # Create video writer
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            self.writer = cv2.VideoWriter(filename, fourcc, fps, (width, height))
+            print(f"Started recording for camera {self.camera_id}")
+    
+    def stop_recording(self):
+        """Stop recording the camera stream."""
+        if self.recording and self.writer:
+            self.recording = False
+            self.writer.release()
+            self.writer = None
+            duration = (datetime.now() - self.start_time).total_seconds()
+            print(f"Stopped recording for camera {self.camera_id} (duration: {duration:.1f}s)")
+    
+    def _process_stream(self):
+        """Process the camera stream in a background thread."""
+        try:
+            self.cap = cv2.VideoCapture(self.stream_url)
+            if not self.cap.isOpened():
+                print(f"Error: Could not open camera stream {self.camera_id} at {self.stream_url}")
+                self.running = False
+                return
+            
+            # Reset frame count
+            self.frame_count = 0
+            self.detections = []
+            
+            # Track suspicious behavior
+            suspicious_frame_count = 0
+            
+            while self.running:
+                ret, frame = self.cap.read()
+                if not ret:
+                    print(f"Error reading frame from camera {self.camera_id}, reconnecting...")
+                    # Try to reconnect
+                    self.cap.release()
+                    time.sleep(2)
+                    self.cap = cv2.VideoCapture(self.stream_url)
+                    continue
+                
+                self.frame_count += 1
+                timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+                
+                # Process the frame
+                frame_detections = process_frame(frame, self.frame_count, self.location, timestamp)
+                self.detections.extend(frame_detections)
+                
+                # Write frame to recording if enabled
+                if self.recording and self.writer:
+                    self.writer.write(frame)
+                
+                # Check for suspicious behavior
+                person_count = sum(1 for d in frame_detections if d["object"] == "person")
+                weapon_count = sum(1 for d in frame_detections if d["object"] in ["knife", "scissors"])
+                
+                # If suspicious behavior detected, start recording
+                if person_count >= 2 and weapon_count >= 1:
+                    suspicious_frame_count += 1
+                    if suspicious_frame_count >= 5:  # If sustained for multiple frames
+                        print(f"SUSPICIOUS BEHAVIOR DETECTED at {self.location} (Camera {self.camera_id})")
+                        
+                        # Start recording if not already recording
+                        if not self.recording:
+                            self.start_recording()
+                        
+                        # Send special alert
+                        alert_data = {
+                            "type": "Security Alert",
+                            "description": f"SUSPICIOUS BEHAVIOR: {person_count} people with {weapon_count} potential weapons",
+                            "severity": "Critical",
+                            "location": self.location,
+                            "timestamp": timestamp,
+                            "camera_id": self.camera_id,
+                            "metadata": {
+                                "behavior": "group_with_weapons",
+                                "person_count": person_count,
+                                "weapon_count": weapon_count,
+                                "frame": self.frame_count
+                            },
+                        }
+                        try:
+                            requests.post(ALERT_API_URL, json=alert_data, headers={"Content-Type": "application/json"})
+                        except Exception as e:
+                            print(f"Error sending behavior alert: {str(e)}")
+                else:
+                    suspicious_frame_count = 0
+                    
+                    # If we were recording due to suspicious behavior but it's gone, stop recording
+                    if self.recording and suspicious_frame_count == 0:
+                        # Stop recording after a delay (30 seconds after suspicious behavior ends)
+                        if self.frame_count % 900 == 0:  # Assuming 30 FPS, check every 30 seconds
+                            self.stop_recording()
+                
+                # Limit CPU usage
+                time.sleep(0.01)
+                
+        except Exception as e:
+            print(f"Error in camera {self.camera_id} stream processing: {str(e)}")
+        finally:
+            if self.cap:
+                self.cap.release()
+            if self.recording and self.writer:
+                self.writer.release()
+
+class CameraManager:
+    """Class to manage multiple security camera streams."""
+    
+    def __init__(self, config_file="camera_config.json"):
+        self.config_file = config_file
+        self.cameras = {}
+        self.load_config()
+    
+    def load_config(self):
+        """Load camera configuration from file."""
+        try:
+            if os.path.exists(self.config_file):
+                with open(self.config_file, 'r') as f:
+                    config = json.load(f)
+                
+                for camera_config in config.get("cameras", []):
+                    camera_id = camera_config.get("id")
+                    stream_url = camera_config.get("url")
+                    location = camera_config.get("location", "Unknown")
+                    
+                    if camera_id and stream_url:
+                        self.add_camera(camera_id, stream_url, location)
+            else:
+                print(f"Config file {self.config_file} not found, starting with empty configuration")
+        except Exception as e:
+            print(f"Error loading camera configuration: {str(e)}")
+    
+    def save_config(self):
+        """Save camera configuration to file."""
+        config = {
+            "cameras": [
+                {
+                    "id": camera_id,
+                    "url": camera.stream_url,
+                    "location": camera.location
+                }
+                for camera_id, camera in self.cameras.items()
+            ]
+        }
+        
+        try:
+            with open(self.config_file, 'w') as f:
+                json.dump(config, f, indent=2)
+            print(f"Saved camera configuration to {self.config_file}")
+        except Exception as e:
+            print(f"Error saving camera configuration: {str(e)}")
+    
+    def add_camera(self, camera_id, stream_url, location_name):
+        """Add a new camera stream."""
+        if camera_id in self.cameras:
+            print(f"Camera {camera_id} already exists, updating configuration")
+            self.cameras[camera_id].stop()
+        
+        camera = CameraStream(camera_id, stream_url, location_name)
+        self.cameras[camera_id] = camera
+        print(f"Added camera {camera_id} at {location_name}")
+        self.save_config()
+        return camera
+    
+    def remove_camera(self, camera_id):
+        """Remove a camera stream."""
+        if camera_id in self.cameras:
+            self.cameras[camera_id].stop()
+            del self.cameras[camera_id]
+            print(f"Removed camera {camera_id}")
+            self.save_config()
+            return True
+        return False
+    
+    def start_all_cameras(self):
+        """Start all camera streams."""
+        for camera_id, camera in self.cameras.items():
+            camera.start()
+    
+    def stop_all_cameras(self):
+        """Stop all camera streams."""
+        for camera_id, camera in self.cameras.items():
+            camera.stop()
+    
+    def get_camera_status(self):
+        """Get status of all cameras."""
+        return {
+            camera_id: {
+                "location": camera.location,
+                "running": camera.running,
+                "recording": camera.recording,
+                "frames_processed": camera.frame_count,
+                "detections": len(camera.detections)
+            }
+            for camera_id, camera in self.cameras.items()
+        }
+
+def main():
+    parser = argparse.ArgumentParser(description="Security Camera Stream Processor")
+    parser.add_argument("--config", default="camera_config.json", help="Camera configuration file")
+    parser.add_argument("--add", action="store_true", help="Add a camera interactively")
+    args = parser.parse_args()
+    
+    manager = CameraManager(args.config)
+    
+    if args.add:
+        camera_id = input("Enter camera ID: ")
+        stream_url = input("Enter stream URL (rtsp://, http://, or device number): ")
+        location = input("Enter camera location: ")
+        
+        # Handle numeric device IDs
+        if stream_url.isdigit():
+            stream_url = int(stream_url)
+        
+        manager.add_camera(camera_id, stream_url, location)
+    
+    try:
+        print("Starting all cameras...")
+        manager.start_all_cameras()
+        print("Press Ctrl+C to stop")
+        
+        while True:
+            status = manager.get_camera_status()
+            print(f"\nStatus ({time.strftime('%H:%M:%S')}): {len(status)} active cameras")
+            for camera_id, info in status.items():
+                print(f"  Camera {camera_id} ({info['location']}): {'🟢' if info['running'] else '🔴'} " + 
+                      f"{'🔴 Recording' if info['recording'] else '⚪'} - " +
+                      f"{info['frames_processed']} frames, {info['detections']} detections")
+            
+            time.sleep(10)
+            
+    except KeyboardInterrupt:
+        print("\nStopping all cameras...")
+        manager.stop_all_cameras()
+        print("Done")
+
+if __name__ == "__main__":
+    main()
